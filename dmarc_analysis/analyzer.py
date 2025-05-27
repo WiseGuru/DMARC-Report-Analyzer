@@ -11,10 +11,14 @@ import zipfile
 from tqdm import tqdm
 import logging
 from io import BytesIO
+import csv
+import time
+import configparser
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+BLACKLIST_CACHE_FILE = 'blacklist_cache.csv'
 
 class DMARCAnalyzer:
     def __init__(self, directory, spamhaus_domain):
@@ -22,63 +26,54 @@ class DMARCAnalyzer:
         self.spamhaus_domain = spamhaus_domain
         self.all_records = []
         self.resolver = dns.resolver.Resolver()
-        self.resolver.nameservers = ['8.8.8.8', '8.8.4.4']  # Use Google DNS servers
+        self.resolver.nameservers = ['8.8.8.8', '8.8.4.4']
+
+        # Load cache threshold (days) from config
+        cfg_path = os.path.join(os.path.dirname(__file__), 'config', 'config.ini')
+        cfg = configparser.ConfigParser()
+        cfg.read(cfg_path)
+        self.cache_threshold_days = int(
+            cfg.get('blacklist', 'cache_update_threshold_days', fallback='7')
+        )
 
     @staticmethod
     def parse_dmarc_report(file_path):
-        """
-        Parse DMARC report from an XML file.
-        This function tries to parse the XML like it's deciphering hieroglyphics.
-        """
         try:
             tree = ET.parse(file_path)
             root = tree.getroot()
-            # Extract the date_range information
-            date_range_elem = root.find('.//date_range')
-            begin = date_range_elem.find('begin').text if date_range_elem is not None and date_range_elem.find(
-                'begin') is not None else None
-            end = date_range_elem.find('end').text if date_range_elem is not None and date_range_elem.find(
-                'end') is not None else None
-
-            records = []
+            dr = root.find('.//date_range')
+            begin = dr.find('begin').text if dr is not None and dr.find('begin') is not None else None
+            end = dr.find('end').text if dr is not None and dr.find('end') is not None else None
+            recs = []
             for record in root.findall('.//record'):
                 row = record.find('row')
-                policy_evaluated = row.find('policy_evaluated') if row is not None else None
-                identifiers = record.find('identifiers')
-
-                if row is not None and policy_evaluated is not None:
-                    source_ip = row.find('source_ip').text if row.find('source_ip') is not None else 'unknown'
-                    count = int(row.find('count').text) if row.find('count') is not None else 0
-                    spf_result = policy_evaluated.find('spf').text if policy_evaluated.find(
-                        'spf') is not None else 'none'
-                    dkim_result = policy_evaluated.find('dkim').text if policy_evaluated.find(
-                        'dkim') is not None else 'none'
-                    header_from = identifiers.find('header_from').text if identifiers is not None and identifiers.find(
-                        'header_from') is not None else 'unknown'
-                    envelope_from = identifiers.find(
-                        'envelope_from').text if identifiers is not None and identifiers.find(
-                        'envelope_from') is not None else 'unknown'
-
-                    records.append({
-                        'source_ip': source_ip,
-                        'count': count,
-                        'spf_result': spf_result,
-                        'dkim_result': dkim_result,
-                        'header_from': header_from,
-                        'envelope_from': envelope_from,
+                pol = row.find('policy_evaluated') if row is not None else None
+                ids = record.find('identifiers')
+                if row is not None and pol is not None:
+                    ip = row.find('source_ip').text if row.find('source_ip') is not None else 'unknown'
+                    cnt = int(row.find('count').text) if row.find('count') is not None else 0
+                    sf = pol.find('spf').text if pol.find('spf') is not None else 'none'
+                    dk = pol.find('dkim').text if pol.find('dkim') is not None else 'none'
+                    hf = ids.find('header_from').text if ids is not None and ids.find('header_from') is not None else 'unknown'
+                    ef = ids.find('envelope_from').text if ids is not None and ids.find('envelope_from') is not None else 'unknown'
+                    et = ids.find('envelope_to').text if ids is not None and ids.find('envelope_to') is not None else 'unknown'
+                    recs.append({
+                        'source_ip': ip,
+                        'count': cnt,
+                        'spf_result': sf,
+                        'dkim_result': dk,
+                        'header_from': hf,
+                        'envelope_from': ef,
+                        'envelope_to': et,
                         'report_begin': begin,
-                        'report_end': end
+                        'report_end': end,
                     })
-            return records
+            return recs
         except ET.ParseError:
             logging.error(f"Error parsing {file_path}")
             return []
 
     def extract_gz(self, file_path):
-        """
-        Extract a .gz file.
-        It's like opening a can of compressed spam, but with less sodium.
-        """
         try:
             with gzip.open(file_path, 'rb') as f:
                 return f.read()
@@ -87,252 +82,211 @@ class DMARCAnalyzer:
             return None
 
     def extract_zip(self, file_path):
-        """
-        Extract a .zip file.
-        Because who doesn't love unzipping compressed chaos?
-        """
         try:
-            with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                xml_files = [name for name in zip_ref.namelist() if name.endswith('.xml')]
-                extracted_files = []
-                for xml_file in xml_files:
-                    with zip_ref.open(xml_file) as f:
-                        extracted_files.append(f.read())
-                return extracted_files
+            with zipfile.ZipFile(file_path, 'r') as z:
+                xmls = [n for n in z.namelist() if n.endswith('.xml')]
+                out = []
+                for n in xmls:
+                    with z.open(n) as f:
+                        out.append(f.read())
+                return out
         except Exception as e:
             logging.error(f"Error extracting {file_path}: {e}")
             return []
 
-    def check_blacklist(self, ip):
-        """
-        Check if an IP is blacklisted.
-         We ask the blacklist, 'Hey, you seen this guy around here?'.
-        """
+    def load_blacklist_cache(self):
+        cache = {}
+        if os.path.exists(BLACKLIST_CACHE_FILE):
+            with open(BLACKLIST_CACHE_FILE, newline='') as cf:
+                rd = csv.DictReader(cf)
+                for r in rd:
+                    ip = r['ip'].strip()
+                    cache[ip] = {
+                        'blacklisted': r['blacklisted'] == 'True',
+                        'result_text': r['result_text'],
+                        'timestamp': float(r['timestamp']),
+                    }
+        return cache
+
+    def save_blacklist_cache(self, cache):
+        with open(BLACKLIST_CACHE_FILE, 'w', newline='') as cf:
+            wr = csv.DictWriter(cf, fieldnames=['ip', 'blacklisted', 'result_text', 'timestamp'])
+            wr.writeheader()
+            for ip, d in cache.items():
+                wr.writerow({'ip': ip, 'blacklisted': d['blacklisted'], 'result_text': d['result_text'], 'timestamp': d['timestamp']})
+
+    def check_blacklist(self, ip, use_cache=True, cache=None):
+        ip = ip.strip()
+        if use_cache and cache is not None and ip in cache:
+            return cache[ip]['blacklisted'], cache[ip]['result_text']
         try:
-            query = '.'.join(reversed(ip.split('.'))) + '.' + self.spamhaus_domain
-            answers = self.resolver.resolve(query, 'A')
-            return True, answers.rrset.to_text()
+            q = '.'.join(reversed(ip.split('.'))) + '.' + self.spamhaus_domain
+            logging.info(f"Querying Spamhaus for IP: {ip}")
+            ans = self.resolver.resolve(q, 'A')
+            bl, rt = True, ans.rrset.to_text()
         except dns.resolver.NXDOMAIN:
-            return False, "Not listed"
+            bl, rt = False, 'Not listed'
         except dns.resolver.Timeout:
-            return False, "Timeout"
+            bl, rt = False, 'Timeout'
         except dns.resolver.NoNameservers as e:
-            logging.error(f"DNS resolution error for {ip}: {e}")
-            return False, "DNS resolution error"
+            logging.error(f"DNS error for {ip}: {e}")
+            bl, rt = False, 'DNS error'
         except dns.exception.DNSException as e:
             logging.error(f"General DNS error for {ip}: {e}")
-            return False, "General DNS error"
+            bl, rt = False, 'DNS error'
+        if cache is not None:
+            cache[ip] = {'blacklisted': bl, 'result_text': rt, 'timestamp': time.time()}
+        return bl, rt
 
     @staticmethod
-    def check_spf_alignment(header_from, envelope_from):
-        """
-        Check SPF alignment.
-        Like checking if your tie matches your socks.
-        """
-        return header_from.split('@')[-1] == envelope_from.split('@')[-1]
+    def check_spf_alignment(hf, ef):
+        return hf.split('@')[-1] == ef.split('@')[-1]
 
     @staticmethod
-    def get_spf_failure_reason(ip, envelope_from):
-        """
-        Get SPF failure reason.
-        Because knowing why you failed is half the battle.
-        """
+    def get_spf_failure_reason(ip, ef):
         try:
-            result, explanation = spf.check2(i=ip, s=envelope_from, h=envelope_from.split('@')[-1])
-            return f"{result}: {explanation}"
-        except spf.SPFError as e:
-            return f"SPF check error: {e}"
+            r, e = spf.check2(i=ip, s=ef, h=ef.split('@')[-1])
+            return f"{r}: {e}"
+        except spf.SPFError as ex:
+            return f"SPF error: {ex}"
 
     def analyze_reports(self):
-        """
-        Analyze DMARC reports in the given directory.
-        We scan, we parse, we laugh, we cry... it's a whole process.
-        """
-        # Scan directory and parse reports
-        logging.info(f"Scanning directory {self.directory} for XML files...")
+        # Stage 1: collect & parse files
+        logging.info(f"Scanning {self.directory} for DMARC files...")
+        file_paths = []
         for root, dirs, files in os.walk(self.directory):
-            for file in files:
-                file_path = os.path.join(root, file)
-                if file.endswith('.xml'):
-                    logging.info(f"Parsing {file_path}...")
-                    records = self.parse_dmarc_report(file_path)
-                    self.all_records.extend(records)
-                elif file.endswith('.gz'):
-                    logging.info(f"Extracting {file_path}...")  # Extracting .gz file, because why make it easy?
-                    content = self.extract_gz(file_path)
+            for fname in files:
+                if fname.endswith(('.xml', '.gz', '.zip')):
+                    file_paths.append(os.path.join(root, fname))
+        for fp in tqdm(file_paths, desc="Scanning DMARC files"):
+            if fp.endswith('.xml'):
+                self.all_records.extend(self.parse_dmarc_report(fp))
+            elif fp.endswith('.gz'):
+                content = self.extract_gz(fp)
+                if content:
+                    self.all_records.extend(self.parse_dmarc_report(BytesIO(content)))
+            elif fp.endswith('.zip'):
+                for content in self.extract_zip(fp):
                     if content:
-                        logging.info(f"Parsing extracted content from {file_path}...")
-                        records = self.parse_dmarc_report(BytesIO(content))
-                        self.all_records.extend(records)
-                elif file.endswith('.zip'):
-                    logging.info(f"Extracting {file_path}...")  # Unzipping like it's 1999
-                    contents = self.extract_zip(file_path)
-                    for content in contents:
-                        if content:
-                            logging.info(f"Parsing extracted content from {file_path}...")
-                            records = self.parse_dmarc_report(BytesIO(content))
-                            self.all_records.extend(records)
-
-        if self.all_records:
-            df = pd.DataFrame(self.all_records)
-
-            # Filter records that fail SPF, DKIM, or both checks
-            df_failed = df[(df['spf_result'] == 'fail') | (df['dkim_result'] == 'fail')].copy()
-
-            if not df_failed.empty:
-                # Analyze the data
-                logging.info("Analyzing DMARC records...")  # Time to do some real work, finally
-                total_emails = df['count'].sum()
-                failed_spf = df_failed[df_failed['spf_result'] == 'fail']['count'].sum()
-                failed_dkim = df_failed[df_failed['dkim_result'] == 'fail']['count'].sum()
-                failed_both = df_failed[(df_failed['spf_result'] == 'fail') & (df_failed['dkim_result'] == 'fail')][
-                    'count'].sum()
-                failed_either = df_failed[(df_failed['spf_result'] == 'fail') | (df_failed['dkim_result'] == 'fail')][
-                    'count'].sum()
-
-                logging.info(f"Total emails: {total_emails}")  # Numbers, numbers everywhere
-                logging.info(f"Emails failed SPF: {failed_spf}")  # SPF failure party
-                logging.info(f"Emails failed DKIM: {failed_dkim}")  # DKIM failure fiesta
-                logging.info(f"Emails failed both SPF and DKIM: {failed_both}")  # Double the fun, double the failure
-
-                # Calculate the number and ratio of emails lost if DMARC had p=reject
-                total_failed = df_failed['count'].sum()
-                lost_emails_ratio = failed_both / total_emails if total_emails > 0 else 0
-                logging.info(f"Total emails that would have been lost with DMARC p=reject: {failed_both}")
-                logging.info(f"Ratio of emails that would have been lost with DMARC p=reject: {lost_emails_ratio:.2%}")
-
-                # Calculate lost emails due to each specific failure
-                lost_emails_spf = failed_spf - failed_both
-                lost_emails_dkim = failed_dkim - failed_both
-                lost_emails_both = failed_both
-
-                # Calculate total emails lost because of blacklisting
-                logging.info("Checking blacklists for IP addresses...")  # Let's see who's been naughty
-                total_blacklisted_emails = 0
-                df_failed['blacklisted'] = False
-                df_failed['spf_failure_reason'] = ''
-                df_failed['dkim_failure_reason'] = ''
-
-                for index, row in tqdm(df_failed.iterrows(), total=df_failed.shape[0]):
-                    ip = row['source_ip']
-                    spf_failure_reason = ''
-                    dkim_failure_reason = ''
-
-                    if row['spf_result'] == 'fail':
-                        spf_failure_reason = self.get_spf_failure_reason(ip, row['envelope_from'])
-
-                    if row['dkim_result'] == 'fail':
-                        dkim_failure_reason = "Failed DKIM check (details not implemented)"
-
-                    df_failed.at[index, 'spf_failure_reason'] = spf_failure_reason
-                    df_failed.at[index, 'dkim_failure_reason'] = dkim_failure_reason
-
-                    is_listed, _ = self.check_blacklist(ip)
-                    if is_listed:
-                        df_failed.at[index, 'blacklisted'] = True
-                        total_blacklisted_emails += row['count']
-
-                # Check SPF alignment
-                df_failed['spf_alignment'] = df_failed.apply(
-                    lambda x: self.check_spf_alignment(x['header_from'], x['envelope_from']), axis=1)
-
-                # Print report
-                summary = (
-                    f"Total emails: {total_emails}\n"
-                    f"Total emails with alignment errors: {failed_either}\n"
-                    f"Emails that fail SPF alignment: {lost_emails_spf}\n"
-                    f"Emails that fail DKIM alignment: {lost_emails_dkim}\n"
-                    f"Emails that fail both SPF and DKIM and would be rejected with DMARC p=reject: {lost_emails_both}\n"
-                    f"Ratio of emails that would have been lost if DMARC had p=reject: {lost_emails_ratio:.2%}\n"
-                    f"Total emails lost due to blacklisting: {total_blacklisted_emails}\n"
-                )
-
-                unique_date_ranges = df_failed[['report_begin', 'report_end']].drop_duplicates()
-
-                date_ranges_text = "Report Periods Covered:\n"
-                for _, row in unique_date_ranges.iterrows():
-                    try:
-                        begin_ts = int(row['report_begin']) if row['report_begin'] is not None else None
-                        end_ts = int(row['report_end']) if row['report_end'] is not None else None
-                        begin_str = datetime.fromtimestamp(begin_ts).strftime(
-                            "%Y-%m-%d %H:%M:%S") if begin_ts else "N/A"
-                        end_str = datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S") if end_ts else "N/A"
-                    except (ValueError, TypeError):
-                        begin_str = row['report_begin'] or "N/A"
-                        end_str = row['report_end'] or "N/A"
-
-                    date_ranges_text += f" - From: {begin_str} To: {end_str}\n"
-
-                summary += "\n" + date_ranges_text
-
-                print(summary)
-
-                # Save the summary to a text file
-                summary_file = os.path.join(os.getcwd(), 'summary.txt')
-                with open(summary_file, 'w') as f:
-                    f.write(summary)
-                logging.info(f"Summary saved to {summary_file}")
-
-                # Save the dataframe to a CSV file for further analysis if needed
-                output_file = os.path.join(os.getcwd(), 'dmarc_report_analysis.csv')
-                aggregated_output_file = os.path.join(os.getcwd(), 'dmarc_report_analysis_aggregated.csv')
-                # Convert date range columns to readable format if they exist
-                if not df_failed.empty and 'report_begin' in df_failed.columns and 'report_end' in df_failed.columns:
-                    df_failed['report_begin_readable'] = df_failed['report_begin'].apply(
-                        lambda x: datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(
-                            x) and x.isdigit() else "N/A"
-                    )
-                    df_failed['report_end_readable'] = df_failed['report_end'].apply(
-                        lambda x: datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(
-                            x) and x.isdigit() else "N/A"
-                    )
-
-                df_failed.to_csv(output_file, index=False)
-                logging.info(f"Analysis complete. Results saved to {output_file}")
-
-                # Create an aggregated DataFrame grouped by report_begin and report_end
-                if not df_failed.empty:
-                    aggregation_functions = {
-                        'count': 'sum',
-                        'spf_result': lambda x: ','.join(x.unique()),
-                        'dkim_result': lambda x: ','.join(x.unique()),
-                        'blacklisted': 'max',
-                        # Add other columns and their aggregation as needed
-                    }
-
-                    aggregated_df = df_failed.groupby(['report_begin', 'report_end'], as_index=False).agg(
-                        aggregation_functions)
-
-                    aggregated_df['report_begin_readable'] = aggregated_df['report_begin'].apply(
-                        lambda x: datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(x) and str(
-                            x).isdigit() else "N/A"
-                    )
-                    aggregated_df['report_end_readable'] = aggregated_df['report_end'].apply(
-                        lambda x: datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(x) and str(
-                            x).isdigit() else "N/A"
-                    )
-
-
-                    aggregated_df.to_csv(aggregated_output_file, index=False)
-                    logging.info(f"Aggregated analysis complete. Results saved to {aggregated_output_file}")
-
-                # Ask user if they want to open the CSV and Resume file
-                open_csv = input("Do you want to open the CSV and Resume file? (yes/no): ").strip().lower()
-                if open_csv == 'yes':
-                    if platform.system() == 'Windows':
-                        os.startfile(output_file)
-                        os.startfile(aggregated_output_file)
-                    elif platform.system() == 'Darwin':  # macOS
-                        subprocess.call(['open', output_file])
-                        subprocess.call(['open', aggregated_output_file])
-                    else:  # Linux and other OS
-                        subprocess.call(['xdg-open', output_file])
-                        subprocess.call(['open', aggregated_output_file])
-
-                return df_failed
-            else:
-                logging.info("No records found that fail SPF or DKIM.")  # All clear, folks!
-                return None
-        else:
-            logging.warning("No valid DMARC records found.")  # Well, that was disappointing
+                        self.all_records.extend(self.parse_dmarc_report(BytesIO(content)))
+        if not self.all_records:
+            logging.warning("No DMARC records found.")
             return None
+
+        # Stage 2: DataFrame and initial stats
+        df = pd.DataFrame(self.all_records)
+        df_all = df.copy()
+        tot = df_all['count'].sum()
+        fa_spf = df_all[df_all['spf_result'] == 'fail']['count'].sum()
+        fa_dkim = df_all[df_all['dkim_result'] == 'fail']['count'].sum()
+        pa_spf = df_all[df_all['spf_result'] == 'pass']['count'].sum()
+        pa_dkim = df_all[df_all['dkim_result'] == 'pass']['count'].sum()
+        fboth = df_all[(df_all['spf_result'] == 'fail') & (df_all['dkim_result'] == 'fail')]['count'].sum()
+        pboth = df_all[(df_all['spf_result'] == 'pass') & (df_all['dkim_result'] == 'pass')]['count'].sum()
+
+        # Stage 3: filter failures
+        df_fail = df_all[(df_all['spf_result'] == 'fail') | (df_all['dkim_result'] == 'fail')].copy()
+        df_fail['blacklisted'] = False
+        df_fail['spf_failure_reason'] = ''
+        df_fail['blacklist_result_text'] = ''
+
+        # Stage 4: build SPF failure reason cache
+        unique_spf = df_fail[df_fail['spf_result'] == 'fail'][['source_ip', 'envelope_from']].drop_duplicates().values
+        spf_cache = {}
+        for ip, env in tqdm(unique_spf, desc="Building SPF cache"):
+            key = (ip.strip(), env.strip())
+            spf_cache[key] = self.get_spf_failure_reason(ip.strip(), env.strip())
+
+        # Stage 5: blacklist checks
+        cache = self.load_blacklist_cache()
+        print("\nBlacklist modes: [Enter]=supplemental [a]=all")
+        choice = input("Choice: ").strip().lower()
+        complete = (choice == 'a')
+        now_ts = time.time()
+        threshold = self.cache_threshold_days * 86400
+        unique_ips = [ip.strip() for ip in df_fail['source_ip'].unique()]
+        if complete:
+            ips_to_check = unique_ips
+        else:
+            ips_to_check = [ip for ip in unique_ips if ip not in cache or now_ts - cache[ip]['timestamp'] > threshold]
+        print(f"Updating {len(ips_to_check)}/{len(unique_ips)} IPs")
+
+        total_blacklisted = 0
+        queried = set()
+        for idx, row in tqdm(df_fail.iterrows(), total=df_fail.shape[0], desc="Checking blacklist"):
+            ip = row['source_ip'].strip()
+            env = row['envelope_from'].strip()
+            if row['spf_result'] == 'fail':
+                df_fail.at[idx, 'spf_failure_reason'] = spf_cache.get((ip, env), '')
+            if ip in ips_to_check and ip not in queried:
+                bl, rt = self.check_blacklist(ip, use_cache=False, cache=cache)
+                queried.add(ip)
+            elif ip in cache:
+                bl, rt = cache[ip]['blacklisted'], cache[ip]['result_text']
+            else:
+                bl, rt = False, 'skipped'
+            df_fail.at[idx, 'blacklist_result_text'] = rt
+            if bl:
+                df_fail.at[idx, 'blacklisted'] = True
+                total_blacklisted += row['count']
+        self.save_blacklist_cache(cache)
+
+        # Stage 6: alignment and flags
+        df_fail['spf_alignment'] = df_fail.apply(lambda x: self.check_spf_alignment(x['header_from'], x['envelope_from']), axis=1)
+        df_all['spf_failure_reason'] = ''
+        df_all.loc[df_fail.index, 'spf_failure_reason'] = df_fail['spf_failure_reason']
+        df_all['failure_flag'] = df_all.apply(lambda x: 2 if x['spf_result']=='fail' and x['dkim_result']=='fail' else 1 if (x['spf_result']=='fail' or x['dkim_result']=='fail') else 0, axis=1)
+        df_fail['failure_flag'] = df_fail.apply(lambda x: 2 if x['spf_result']=='fail' and x['dkim_result']=='fail' else 1, axis=1)
+
+        # Stage 7: summary and CSV saving
+        lost_ratio = fboth / tot if tot > 0 else 0
+        summary = (
+            f"Total emails: {tot}\n"
+            f"Passed SPF: {pa_spf}, Passed DKIM: {pa_dkim}, Passed both: {pboth}\n"
+            f"Failed SPF: {fa_spf}, Failed DKIM: {fa_dkim}, Failed both: {fboth}\n"
+            f"Lost if reject: {lost_ratio:.2%}\n"
+            f"Blacklisted lost: {total_blacklisted}\n"
+        )
+        print(summary)
+        with open('summary.txt', 'w') as f:
+            f.write(summary)
+
+        df_all['report_begin_readable'] = df_all['report_begin'].apply(
+            lambda x: datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M:%S")
+            if pd.notnull(x) and str(x).isdigit() else "N/A"
+        )
+        df_all['report_end_readable'] = df_all['report_end'].apply(
+            lambda x: datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M:%S")
+            if pd.notnull(x) and str(x).isdigit() else "N/A"
+        )
+        df_all.to_csv('dmarc_report_analysis_all.csv', index=False)
+        df_fail.to_csv('dmarc_report_analysis_failed.csv', index=False)
+
+        agg_funcs = {
+            'count': 'sum',
+            'spf_result': lambda x: ','.join(x.unique()),
+            'dkim_result': lambda x: ','.join(x.unique()),
+            'blacklisted': 'max',
+            'failure_flag': 'max',
+        }
+        agg_df = df_fail.groupby(['report_begin', 'report_end'], as_index=False).agg(agg_funcs)
+        agg_df['report_begin_readable'] = agg_df['report_begin'].apply(
+            lambda x: datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M:%S")
+            if pd.notnull(x) and str(x).isdigit() else "N/A"
+        )
+        agg_df['report_end_readable'] = agg_df['report_end'].apply(
+            lambda x: datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M:%S")
+            if pd.notnull(x) and str(x).isdigit() else "N/A"
+        )
+        agg_df.to_csv('dmarc_report_analysis_aggregated.csv', index=False)
+
+        # Optionally open CSVs
+        if input('Open CSV files? (yes/no): ').strip().lower() == 'yes':
+            opener = 'os.startfile' if platform.system() == 'Windows' else 'open'
+            for fn in ['dmarc_report_analysis_all.csv', 'dmarc_report_analysis_failed.csv', 'dmarc_report_analysis_aggregated.csv']:
+                if platform.system() == 'Windows':
+                    os.startfile(fn)
+                else:
+                    subprocess.call([opener, fn])
+
+        return df_fail

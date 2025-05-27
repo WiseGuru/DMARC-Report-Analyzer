@@ -2,6 +2,9 @@
 query_key = XXXX
 domain = zen.dq.spamhaus.net
 
+[blacklist]
+cache_update_threshold_days = 7
+
 [email]
 imap_server = imap.gmail.com
 email_user = your@mail.com

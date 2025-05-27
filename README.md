@@ -64,6 +64,19 @@ To run the analyzer, simply execute the main.py script. It will ask if you want 
 python main.py
 ```
 
+On Linux, I recommend creating a bash script similar to the instal script that sets the virtual environment and installs any necessary requirements.
+
+```bash
+#!/usr/bin/env bash
+cd ~/scripts/DMARC-Report-Analyzer
+# Optional
+python3 -m venv env
+source env/bin/activate  # On Windows use `env\Scripts\activate`
+# Mandatory
+pip install -r requirements.txt
+python3 main.py
+```
+
 ## Example
 Here's a quick rundown of what you'll see:
 

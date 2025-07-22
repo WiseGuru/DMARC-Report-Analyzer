@@ -24,7 +24,7 @@ And like all good Swiss Army knives, it's sharp, versatile, and slightly dangero
 First, clone this repository to your local machine. You know the drill:
 
 ```bash
-git clone https://github.com/QbDVision-Inc/DMARC-Report-Analyzer
+git clone https://github.com/WiseGuru/DMARC-Report-Analyzer
 cd DMARC-Report-Analyzer
 # Optional 
 python3 -m venv env
@@ -62,6 +62,19 @@ To run the analyzer, simply execute the main.py script. It will ask if you want 
 
 ```bash
 python main.py
+```
+
+On Linux, I recommend creating a bash script similar to the instal script that sets the virtual environment and installs any necessary requirements.
+
+```bash
+#!/usr/bin/env bash
+cd ~/scripts/DMARC-Report-Analyzer
+# Optional
+python3 -m venv env
+source env/bin/activate  # On Windows use `env\Scripts\activate`
+# Mandatory
+pip install -r requirements.txt
+python3 main.py
 ```
 
 ## Example

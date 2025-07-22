@@ -1,9 +1,15 @@
+[general]
+timezone_offset = +00:00
+
 [spamhaus]
 query_key = XXXX
 domain = zen.dq.spamhaus.net
 
+[blacklist]
+cache_update_threshold_days = 28
+
 [email]
-imap_server = imap.gmail.com
+imap_server = imap.mail.com
 email_user = your@mail.com
 
 ; Please, use an app password for non-MFA
